@@ -244,6 +244,7 @@ def _resp(gs: dict) -> dict:
         'num_bots':      len(_S.get('bots', [])),
         'max_bots':      5,
         'human_folded':  _S.get('human_folded', False),
+        'game_type':     _S['cfg']['game_type'],
     }
 
 
@@ -670,7 +671,8 @@ function render() {
   }
 
   // ── Header ────────────────────────────────────────────────────────────────
-  $('hinfo').textContent = `Hand #${G.hand_count}  ${gs.street.toUpperCase()}`;
+  const gtLabel = G.game_type==='fixed_limit' ? 'FL $2/$4' : 'PL';
+  $('hinfo').textContent = `${gtLabel}  Hand #${G.hand_count}  ${gs.street.toUpperCase()}`;
 
   const bots    = G.players.filter(p=>!p.is_human);
   const human   = G.players.find(p=>p.is_human);
@@ -730,9 +732,13 @@ function render() {
     if(L.can_fold)  btns.push(`<button class="btn fold" onclick="act('fold')">Fold</button>`);
     if(L.can_check) btns.push(`<button class="btn chk"  onclick="act('check')">Check</button>`);
     if(L.can_call)  btns.push(`<button class="btn call" onclick="act('call')">Call $${L.call_amount}</button>`);
+    if(L.can_raise && G.game_type==='fixed_limit') {
+      const betLabel = L.call_amount===0 ? `Bet $${mn}` : `Raise $${mn}`;
+      btns.push(`<button class="btn rbtn" onclick="act('raise',${mn})">${betLabel}</button>`);
+    }
     if(btns.length) h+=`<div class="btnrow">${btns.join('')}</div>`;
 
-    if(L.can_raise) {
+    if(L.can_raise && G.game_type!=='fixed_limit') {
       h+=`<div class="rctrl">
         <label>Raise to: $<span id="rd">${RA||mn}</span>&nbsp;&nbsp;(min $${mn} &ndash; max $${mx})</label>
         <div class="rrow">
@@ -774,8 +780,8 @@ function renderStart() {
       <input type="number" id="ss" value="200" min="10" max="1000000" inputmode="numeric"></div>
     <div class="fg"><label>Game Type</label>
       <select id="gt">
-        <option value="pot_limit">Pot Limit</option>
-        <option value="fixed_limit">Fixed Limit</option>
+        <option value="pot_limit">Pot Limit — max bet = pot size, no raise cap</option>
+        <option value="fixed_limit">Fixed Limit $2/$4 — fixed bets, max 4 raises/street</option>
       </select></div>
     <div class="fg"><label>Number of Bots</label>
       <div class="bot-row">
