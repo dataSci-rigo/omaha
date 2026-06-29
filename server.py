@@ -507,7 +507,11 @@ body{display:flex;flex-direction:column;align-items:center;padding:8px;max-width
 <script>
 // ── Audio ─────────────────────────────────────────────────────────────────────
 let _ac = null;
-function ac() { return _ac || (_ac = new (window.AudioContext||window.webkitAudioContext)()); }
+function ac() {
+  if (!_ac) _ac = new (window.AudioContext||window.webkitAudioContext)();
+  if (_ac.state === 'suspended') _ac.resume();
+  return _ac;
+}
 function tone(freq, dur, type, vol, when) {
   const c=ac(), t=c.currentTime+(when||0);
   const o=c.createOscillator(), g=c.createGain();
