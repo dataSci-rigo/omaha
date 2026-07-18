@@ -14,9 +14,11 @@ from typing import Optional
 
 from flask import Flask, jsonify, render_template_string, request
 from pokerkit import (
-    Automation, FixedLimitOmahaHoldemHighLowSplitEightOrBetter,
+    Automation, Card, FixedLimitOmahaHoldemHighLowSplitEightOrBetter,
     OmahaEightOrBetterLowHand, OmahaHoldemHand, PotLimitOmahaHoldem,
 )
+
+from abc_omaha_hilo import hi_strength, lo_strength, preflop_score
 
 # ── Game engine ────────────────────────────────────────────────────────────────
 
@@ -144,6 +146,80 @@ class RandomBot:
         return Action(choice)
 
 
+def _read_hand(gs: dict, pos: int) -> tuple:
+    """Parse a player's hole cards and the board into pokerkit Card objects."""
+    hole = Card.clean(''.join(gs['hole_cards'][pos]))
+    board = Card.clean(''.join(gs['board']))
+    return hole, board
+
+
+def _fallback_action(legal: dict) -> Action:
+    """The weakest non-fold action available, used when a bot's chosen
+    action turns out to be illegal (e.g. it wants to fold but can only
+    check)."""
+    if legal.get('can_check'):
+        return Action('check')
+    if legal.get('can_call'):
+        return Action('call')
+    if legal.get('can_fold'):
+        return Action('fold')
+    return Action('check')
+
+
+class ABCBot:
+    """Absolute hand strength bot — evaluates its own hand in isolation
+    and maps it to fold/call/raise via fixed thresholds. Ported from
+    abc_omaha_hilo.py's ABCBot, adapted to the web server's gs-based
+    decide() interface and its legal_actions/raise-amount semantics."""
+
+    HI_WEIGHT = 0.55
+    LO_WEIGHT = 0.45
+    PREFLOP_FOLD = 0.22
+    PREFLOP_RAISE = 0.50
+    POSTFLOP_FOLD = 0.18
+    POSTFLOP_RAISE = 0.45
+
+    def __init__(self, name: str, starting_stack: int) -> None:
+        self.name = name
+        self.starting_stack = starting_stack
+
+    def _composite(self, hi: float, lo: float) -> float:
+        if lo > 0:
+            return self.HI_WEIGHT * hi + self.LO_WEIGHT * lo
+        return hi * 0.55
+
+    def decide(self, gs: dict, my_pos: int) -> Action:
+        legal = gs['legal_actions']
+        hole, board = _read_hand(gs, my_pos)
+
+        if gs['street'] == 'preflop':
+            score = preflop_score(hole)
+            fold_th, raise_th = self.PREFLOP_FOLD, self.PREFLOP_RAISE
+        else:
+            score = self._composite(hi_strength(hole, board), lo_strength(hole, board))
+            fold_th, raise_th = self.POSTFLOP_FOLD, self.POSTFLOP_RAISE
+
+        if score < fold_th and legal.get('can_fold'):
+            return Action('fold')
+        if score >= raise_th and legal.get('can_raise'):
+            return Action('raise', int(legal['min_raise']))
+        return _fallback_action(legal)
+
+
+class CallerBot:
+    """Always calls/checks, never folds, never raises."""
+
+    def __init__(self, name: str, starting_stack: int) -> None:
+        self.name = name
+        self.starting_stack = starting_stack
+
+    def decide(self, gs: dict, my_pos: int) -> Action:
+        return _fallback_action(gs['legal_actions'])
+
+
+BOT_TYPES = {'random': RandomBot, 'abc': ABCBot, 'caller': CallerBot}
+
+
 # ── Flask server ───────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -245,6 +321,7 @@ def _resp(gs: dict) -> dict:
         'max_bots':      5,
         'human_folded':  _S.get('human_folded', False),
         'game_type':     _S['cfg']['game_type'],
+        'bot_type':      _S.get('bot_type', 'random'),
     }
 
 
@@ -280,20 +357,23 @@ def api_new_game():
     start = int(body.get('starting_stack', 200))
     gtype = body.get('game_type', 'pot_limit')
     nbots = max(1, min(5, int(body.get('num_bots', 1))))
+    btype = body.get('bot_type', 'random')
+    bot_cls = BOT_TYPES.get(btype, RandomBot)
     cfg   = {'game_type': gtype, 'fixed_small_bet': 2, 'fixed_big_bet': 4,
              'small_blind': 1, 'big_blind': 2}
     _S.clear()
     _S.update({
         'engine':          GameEngine(cfg),
-        'bots':            [RandomBot(f'Bot {i+1}', start) for i in range(nbots)],
+        'bots':            [bot_cls(f'Bot {i+1}', start) for i in range(nbots)],
         'stacks':          [start] * (nbots + 1),
         'dealer_seat':     0,
         'hand_count':      0,
         'starting_stack':  start,
+        'bot_type':        btype,
         'cfg':             cfg,
     })
     _log({'event': 'new_game', 'starting_stack': start,
-          'game_type': gtype, 'num_bots': nbots})
+          'game_type': gtype, 'num_bots': nbots, 'bot_type': btype})
     return _start_hand()
 
 
@@ -372,7 +452,8 @@ def api_add_bot():
         return jsonify({'error': 'Wait for the hand to end'}), 400
     name  = f'Bot {len(_S["bots"]) + 1}'
     start = _S.get('starting_stack', 200)
-    _S['bots'].append(RandomBot(name, start))
+    bot_cls = BOT_TYPES.get(_S.get('bot_type', 'random'), RandomBot)
+    _S['bots'].append(bot_cls(name, start))
     _S['stacks'].append(start)
     _log({'event': 'add_bot', 'name': name, 'stack': start})
     return jsonify({'ok': True, 'name': name,
@@ -575,8 +656,9 @@ async function newGame() {
   const start = parseInt($('ss')?.value||'200');
   const type  = $('gt')?.value||'pot_limit';
   const nbots = parseInt($('nb')?.value||'1');
+  const btype = $('bt')?.value||'random';
   _prevStreet=null; _prevHandOver=false; _prevHandCount=0;
-  G = await post('/api/new_game', {starting_stack:start, game_type:type, num_bots:nbots});
+  G = await post('/api/new_game', {starting_stack:start, game_type:type, num_bots:nbots, bot_type:btype});
   SFX.deal(); render();
 }
 
@@ -787,6 +869,12 @@ function renderStart() {
       <select id="gt">
         <option value="pot_limit">Pot Limit — max bet = pot size, no raise cap</option>
         <option value="fixed_limit">Fixed Limit $2/$4 — fixed bets, max 4 raises/street</option>
+      </select></div>
+    <div class="fg"><label>Opponent Type</label>
+      <select id="bt">
+        <option value="random">Random — plays uniformly random legal actions</option>
+        <option value="abc">ABC — evaluates hand strength, folds/calls/raises by threshold</option>
+        <option value="caller">Caller — always calls, never folds or raises</option>
       </select></div>
     <div class="fg"><label>Number of Bots</label>
       <div class="bot-row">
