@@ -53,8 +53,17 @@ class Bot(Protocol):
         to_call: float,
         can_raise: bool,
         street: str,
+        history: list[dict] | None = None,
+        hero_index: int | None = None,
     ) -> str:
-        """Return 'fold', 'call', or 'raise'."""
+        """Return 'fold', 'call', or 'raise'.
+
+        `history` is the sequence of actions taken so far this hand
+        (each a dict with 'actor', 'street', 'action'), and `hero_index`
+        is this bot's own seat in the current hand — both optional,
+        for bots that model opponents (e.g. BayesianBot). Bots that
+        don't need them can ignore the parameters.
+        """
         ...
 
 
@@ -198,6 +207,8 @@ class ABCBot:
         to_call: float,
         can_raise: bool,
         street: str,
+        history: list[dict] | None = None,
+        hero_index: int | None = None,
     ) -> str:
         if street == "preflop":
             score = preflop_score(hole_cards)
@@ -229,7 +240,8 @@ class RandomBot:
 
     name: str = "Random"
 
-    def decide(self, hole_cards, board, pot, to_call, can_raise, street) -> str:
+    def decide(self, hole_cards, board, pot, to_call, can_raise, street,
+               history=None, hero_index=None) -> str:
         choices = ["fold", "call"]
         if can_raise:
             choices.append("raise")
@@ -246,7 +258,8 @@ class CallerBot:
 
     name: str = "Caller"
 
-    def decide(self, hole_cards, board, pot, to_call, can_raise, street) -> str:
+    def decide(self, hole_cards, board, pot, to_call, can_raise, street,
+               history=None, hero_index=None) -> str:
         return "call"
 
 
@@ -322,6 +335,7 @@ def play_one_hand(
     # Play until the hand ends
     actions_taken = 0
     max_actions = 200  # safety valve
+    history: list[dict] = []
 
     while state.status and actions_taken < max_actions:
         actor = state.actor_index
@@ -345,26 +359,32 @@ def play_one_hand(
             to_call,
             can_raise,
             street,
+            history=list(history),
+            hero_index=actor,
         )
 
-        actual = decision
+        applied = "fold"
         try:
             if decision == "fold" and state.can_fold():
                 state.fold()
+                applied = "fold"
             elif decision == "raise" and can_raise:
                 state.complete_bet_or_raise_to()
+                applied = "raise"
             else:
-                actual = "check/call"
+                applied = "call"
                 state.check_or_call()
         except (ValueError, IndexError):
-            actual = "check/call*"
+            applied = "call"
             try:
                 state.check_or_call()
             except Exception:
                 break
 
+        history.append({"actor": actor, "street": street, "action": applied})
+
         if verbose:
-            print(f"    {street:8s} | {bot.name} [{actor}] → {actual}")
+            print(f"    {street:8s} | {bot.name} [{actor}] → {applied}")
 
         actions_taken += 1
 
