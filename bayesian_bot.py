@@ -237,7 +237,7 @@ class BayesianBot:
     range, not just absolute hand strength."""
 
     def __init__(self, name: str = "Bayesian", model_path: str = DEFAULT_MODEL_PATH,
-                 fold_margin: float = 0.08, raise_margin: float = 0.08,
+                 fold_margin: float = 0.05, raise_margin: float = 0.10,
                  preflop_model: "NaiveBayesPreflop | None" = None,
                  action_model: "ActionModel | None" = None) -> None:
         self.name = name
@@ -283,13 +283,18 @@ class BayesianBot:
     ) -> str:
         own_score = self._own_score(hole_cards, board, street)
         opponent_est = self._opponent_estimate(history, hero_index)
+        edge = own_score - opponent_est
 
+        # Raw pot odds: do we have enough equity to continue on price alone?
         required_equity = to_call / (pot + to_call) if (pot + to_call) > 0 else 0.0
-        threshold = max(required_equity, opponent_est * 0.9)
+        pot_odds_ok = own_score >= required_equity
 
-        if own_score < threshold - self.fold_margin:
+        # Fold only when the price is bad *and* we look behind the toughest
+        # active opponent's estimated range — good odds alone (cheap call)
+        # or a favorable read alone (bad odds but likely ahead) both keep us in.
+        if not pot_odds_ok and edge < -self.fold_margin:
             return "fold"
-        if own_score >= threshold + self.raise_margin and can_raise:
+        if can_raise and edge > self.raise_margin:
             return "raise"
         return "call"
 
@@ -439,20 +444,56 @@ def self_play_refine(preflop_model: NaiveBayesPreflop, action_model: ActionModel
                       tol: float = 0.01, n_players: int = 4, seed: int = 99,
                       path: str = DEFAULT_MODEL_PATH, verbose: bool = True,
                       ) -> tuple[NaiveBayesPreflop, ActionModel]:
-    """Repeatedly play BayesianBot against copies of itself using the
-    current model, retrain a fresh model from those games, and swap it in.
-    Stops when `_model_distance` between successive models drops below
-    `tol`, or after `max_rounds`."""
-    random.seed(seed)
-    current = (preflop_model, action_model)
+    """Refine the model via self-play, seeded from `preflop_model`/`action_model`
+    (typically an already-validated baseline).
 
+    Two things that plain self-play gets wrong, both fixed here:
+
+    - **Accumulation**: each round's data is merged into the running model
+      (via `fit`, which only adds counts) rather than discarding prior
+      rounds and refitting from scratch. Without this, round-over-round
+      "drift" never shrinks — it's just fresh sampling noise every time,
+      since nothing pools. With accumulation, each new round's data is a
+      smaller fraction of the growing total, so drift decays and the
+      process actually has a fixed point to converge to.
+    - **Opponent mix**: half the table each round is Random/Caller/ABC,
+      not just copies of the current Bayesian model. Pure mirror-self-play
+      lets the action-likelihood model specialize to mirror-match dynamics
+      and forget how to read genuinely different opponents (e.g. ABCBot),
+      which is what caused the earlier regression.
+    """
+    random.seed(seed)
+    # Start the accumulator from the seed model's own counts, so refinement
+    # builds on the validated baseline instead of discarding it.
+    accum_pf = NaiveBayesPreflop.from_dict(preflop_model.to_dict())
+    accum_am = ActionModel.from_dict(action_model.to_dict())
+
+    opponent_pool = [
+        RandomBot(name="Random"),
+        CallerBot(name="Caller"),
+        ABCBot(name="ABC-tight", preflop_fold=0.30, postflop_fold=0.25),
+        ABCBot(name="ABC-loose", preflop_fold=0.12, postflop_fold=0.10, preflop_raise=0.40, postflop_raise=0.35),
+    ]
+    n_bayes_seats = max(1, n_players // 2)
+    n_opp_seats = n_players - n_bayes_seats
+
+    dist = float("inf")
     for round_num in range(1, max_rounds + 1):
-        bots = [
-            BayesianBot(f"Bayes{i}", preflop_model=current[0], action_model=current[1])
-            for i in range(n_players)
+        # Snapshot pre-round state (cheap dict round-trip) to measure drift.
+        snapshot = (
+            NaiveBayesPreflop.from_dict(accum_pf.to_dict()),
+            ActionModel.from_dict(accum_am.to_dict()),
+        )
+
+        bayes_bots = [
+            BayesianBot(f"Bayes{i}", preflop_model=accum_pf, action_model=accum_am)
+            for i in range(n_bayes_seats)
         ]
+        opp_bots = [random.choice(opponent_pool) for _ in range(n_opp_seats)]
+        table = bayes_bots + opp_bots
+
         action_records: list[tuple[str, int, str]] = []
-        recorders = [RecordingBot(b, action_records) for b in bots]
+        recorders = [RecordingBot(b, action_records) for b in table]
         preflop_records: list[tuple[dict[str, int], bool]] = []
 
         for hand_num in range(hands_per_round):
@@ -463,18 +504,15 @@ def self_play_refine(preflop_model: NaiveBayesPreflop, action_model: ActionModel
                 feats = preflop_features(result.hole_cards[seat])
                 preflop_records.append((feats, result.payoffs[seat] > 0))
 
-        new_pf = NaiveBayesPreflop()
-        new_pf.fit(preflop_records)
-        new_am = ActionModel()
-        new_am.fit(action_records)
-        new = (new_pf, new_am)
+        accum_pf.fit(preflop_records)
+        accum_am.fit(action_records)
 
-        dist = _model_distance(current, new)
+        dist = _model_distance(snapshot, (accum_pf, accum_am))
         if verbose:
-            print(f"  round {round_num:2d}: {hands_per_round} self-play hands, "
+            print(f"  round {round_num:2d}: {hands_per_round} hands "
+                  f"({n_bayes_seats} Bayesian + {n_opp_seats} baseline seats), "
                   f"model drift = {dist:.5f} (tol {tol})")
 
-        current = new
         if dist < tol:
             if verbose:
                 print(f"  converged after round {round_num} (drift {dist:.5f} < {tol})\n")
@@ -483,7 +521,8 @@ def self_play_refine(preflop_model: NaiveBayesPreflop, action_model: ActionModel
         if verbose:
             print(f"  stopped at max_rounds={max_rounds} without converging (last drift {dist:.5f})\n")
 
-    save_model(current[0], current[1], path)
+    save_model(accum_pf, accum_am, path)
+    current = (accum_pf, accum_am)
     return current
 
 

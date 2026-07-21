@@ -19,6 +19,11 @@ from pokerkit import (
 )
 
 from abc_omaha_hilo import hi_strength, lo_strength, preflop_score
+from bayesian_bot import BayesianBot as _BayesianBotCore
+from bayesian_bot import (
+    composite_score, load_model as _load_bayesian_model, preflop_features,
+    save_model as _save_bayesian_model, strength_bucket,
+)
 
 # ── Game engine ────────────────────────────────────────────────────────────────
 
@@ -217,7 +222,55 @@ class CallerBot:
         return _fallback_action(gs['legal_actions'])
 
 
-BOT_TYPES = {'random': RandomBot, 'abc': ABCBot, 'caller': CallerBot}
+class BayesianBotWeb:
+    """Wraps bayesian_bot.BayesianBot (naive-Bayes preflop classifier +
+    live Bayesian updating of opponents' hand-strength posteriors from
+    their betting actions each street) for the web server's gs-based
+    decide() interface. The trained model is loaded once per process and
+    shared across all Bayesian bot instances — and with every game (see
+    `_learn_from_hand`), regardless of which opponent type is selected."""
+
+    _preflop_model = None
+    _action_model = None
+
+    @classmethod
+    def ensure_models_loaded(cls) -> None:
+        if cls._preflop_model is None:
+            cls._preflop_model, cls._action_model = _load_bayesian_models_for_web()
+
+    def __init__(self, name: str, starting_stack: int) -> None:
+        self.name = name
+        self.starting_stack = starting_stack
+        BayesianBotWeb.ensure_models_loaded()
+        self._inner = _BayesianBotCore(
+            name=name,
+            preflop_model=BayesianBotWeb._preflop_model,
+            action_model=BayesianBotWeb._action_model,
+        )
+
+    def decide(self, gs: dict, my_pos: int) -> Action:
+        legal = gs['legal_actions']
+        hole, board = _read_hand(gs, my_pos)
+
+        decision = self._inner.decide(
+            hole, board, gs['pot'], legal.get('call_amount', 0),
+            legal.get('can_raise', False), gs['street'],
+            history=gs.get('history'), hero_index=my_pos,
+        )
+        if decision == 'fold' and legal.get('can_fold'):
+            return Action('fold')
+        if decision == 'raise' and legal.get('can_raise'):
+            return Action('raise', int(legal['min_raise']))
+        return _fallback_action(legal)
+
+
+def _normalize_action(action_type: str) -> str:
+    """Collapse check/call to a single 'call' label, matching the 3-way
+    fold/call/raise action space bayesian_bot.py was trained on."""
+    return 'call' if action_type in ('check', 'call') else action_type
+
+
+BOT_TYPES = {'random': RandomBot, 'abc': ABCBot, 'caller': CallerBot, 'bayesian': BayesianBotWeb}
 
 
 # ── Flask server ───────────────────────────────────────────────────────────────
@@ -227,6 +280,56 @@ _DIR     = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(_DIR, 'game_log.json')
 _lock    = threading.Lock()
 _S: dict = {}   # single-user session
+
+# ── Bayesian online learning ────────────────────────────────────────────────────
+# Learns from real games (vs. one human or several, any mix of human/bot seats)
+# as they're played. Only ever trains on a seat's true hole cards if that seat
+# reached showdown (didn't fold) this hand — a folded hand is never revealed in
+# real poker, so the bot must not "peek" at it just because the server happens
+# to know it. Persists separately from the offline-trained baseline so it never
+# silently overwrites the validated model; builds on top of it at first load.
+ONLINE_MODEL_PATH = os.path.join(_DIR, 'bayesian_model_online.json')
+_LEARN: dict = {'preflop_records': [], 'action_records': []}
+
+
+def _load_bayesian_models_for_web():
+    if os.path.exists(ONLINE_MODEL_PATH):
+        return _load_bayesian_model(ONLINE_MODEL_PATH)
+    return _load_bayesian_model()  # offline-trained baseline, or blank if absent
+
+
+def _learn_from_hand(gs: dict) -> None:
+    # Learn from every game, regardless of which opponent type was selected —
+    # loads the model on first use if no Bayesian bot has been instantiated yet.
+    BayesianBotWeb.ensure_models_loaded()
+    history = _S.get('history', [])
+    folded = {e['actor'] for e in history if e['action'] == 'fold'}
+    payoffs = gs['payoffs'] or [0] * gs['player_count']
+
+    for pk in range(gs['player_count']):
+        if pk in folded:
+            continue  # never shown down — hand stays hidden, no peeking
+        hole = Card.clean(''.join(gs['hole_cards'][pk]))
+        _LEARN['preflop_records'].append((preflop_features(hole), payoffs[pk] > 0))
+        for e in history:
+            if e['actor'] != pk:
+                continue
+            if e['street'] == 'preflop':
+                score = preflop_score(hole)
+            else:
+                board = Card.clean(''.join(e['board']))
+                score = composite_score(hi_strength(hole, board), lo_strength(hole, board))
+            _LEARN['action_records'].append((e['street'], strength_bucket(score), e['action']))
+
+    BayesianBotWeb._preflop_model.fit(_LEARN['preflop_records'])
+    BayesianBotWeb._action_model.fit(_LEARN['action_records'])
+    _save_bayesian_model(BayesianBotWeb._preflop_model, BayesianBotWeb._action_model, ONLINE_MODEL_PATH)
+    _log({'event': 'bayesian_online_update',
+          'preflop_samples': len(_LEARN['preflop_records']),
+          'action_samples': len(_LEARN['action_records']),
+          'revealed_seats': gs['player_count'] - len(folded)})
+    _LEARN['preflop_records'].clear()
+    _LEARN['action_records'].clear()
 
 
 def _log(entry: dict) -> None:
@@ -282,7 +385,11 @@ def _run_bot(gs: dict, one_street: bool = False) -> dict:
         bot_pos  = gs['actor_index']
         abs_seat = _S['rotation'][bot_pos]
         bot      = _S['bots'][abs_seat - 1]   # bots indexed from abs_seat 1
+        gs['history'] = _S.setdefault('history', [])
         action   = bot.decide(gs, bot_pos)
+        _S['history'].append({'actor': bot_pos, 'street': gs['street'],
+                               'board': list(gs['board']),
+                               'action': _normalize_action(action.action_type)})
         _log({'event': 'bot_action', 'hand': _S['hand_count'],
               'actor': gs['player_names'][bot_pos],
               'action': action.action_type, 'amount': action.amount,
@@ -302,6 +409,7 @@ def _finalise_hand(gs: dict) -> None:
           'payoffs':    {gs['player_names'][i]: payoffs[i]
                          for i in range(gs['player_count'])},
           'stacks': _S['stacks'][:]})
+    _learn_from_hand(gs)
     _advance_dealer()
 
 
@@ -334,6 +442,7 @@ def _start_hand():
     _S['rotation'] = rotation
     _S['human_folded'] = False
     _S['hand_count'] += 1
+    _S['history'] = []
     gs = _S['engine'].start_hand(names, stacks)
     _log({'event': 'new_hand', 'hand': _S['hand_count'],
           'dealer_seat': _S['dealer_seat'], 'stacks': _S['stacks'][:]})
@@ -401,6 +510,9 @@ def api_action():
     if gs['actor_index'] != hpk:
         return jsonify({'error': 'Not your turn'}), 400
     action = Action(body.get('action'), body.get('amount'))
+    _S.setdefault('history', []).append({'actor': hpk, 'street': gs['street'],
+                                          'board': list(gs['board']),
+                                          'action': _normalize_action(action.action_type)})
     _log({'event': 'human_action', 'hand': _S['hand_count'],
           'action': action.action_type, 'amount': action.amount,
           'street': gs['street'], 'pot': gs['pot'],
@@ -875,6 +987,7 @@ function renderStart() {
         <option value="random">Random — plays uniformly random legal actions</option>
         <option value="abc">ABC — evaluates hand strength, folds/calls/raises by threshold</option>
         <option value="caller">Caller — always calls, never folds or raises</option>
+        <option value="bayesian">Bayesian — reads opponents' ranges from their bets, learns as it plays</option>
       </select></div>
     <div class="fg"><label>Number of Bots</label>
       <div class="bot-row">
